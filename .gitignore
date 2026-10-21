@@ -1,0 +1,36 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+*.partial
+.backup.lock
+.recover-*.lock
+*.asar
+*.zip
+*.tgz
+*.bak*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local acceptance evidence and machine-specific history are not source code.
+/validation/
+/ACCEPTANCE.md
+/reports/
+
+# Never commit conversation data, backup stores, or restored output.
+/.dsh/
+/sessions/
+/attachments/
+/storages/
+/objects/
+/snapshots/
+/backups/
+/restore/
+/tmp/
+/format.json
+/last-status.json
+/backup-runs.jsonl
+/RESTORE-COMPLETE.json
+/RESTORE-FAILED.json

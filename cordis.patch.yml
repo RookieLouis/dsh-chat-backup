@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-chat-backup
+      name: dsh-chat-backup
+      config:
+        enabled: true
+        intervalMinutes: 5

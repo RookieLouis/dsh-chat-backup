@@ -1,0 +1,445 @@
+/** The native Remote contribution mirrors the four host-owned backup methods. */
+export const BACKUP_REMOTE_CONTRIBUTION = {
+  package: 'dsh-chat-backup',
+  descriptors: ['getState', 'acknowledge', 'backupNow', 'validateDestination'].map((method) => ({
+    id: `dsh-chat-backup#dshChatBackup/${method}`,
+    service: 'dshChatBackup',
+    namespace: 'dshChatBackup',
+    method,
+    invocation: { kind: 'direct' },
+    parameters: method === 'acknowledge' || method === 'validateDestination' ? [{
+      name: method === 'acknowledge' ? 'id' : 'destinationRoot',
+      wire: method === 'acknowledge' ? 'id' : 'destinationRoot',
+      source: 'json',
+      codec: {
+        mode: 'strict', typeSymbol: 'string',
+        create: () => ({ parse(value) {
+          if (typeof value !== 'string') throw new TypeError('Expected string');
+          return value;
+        } }),
+      },
+    }] : [],
+    result: { mode: 'src-json' },
+  })),
+};
+
+function rpcValue(result) {
+  if (result?.ok === true) return result.value;
+  const detail = result?.error?.message || result?.error?.code;
+  throw new Error(detail || '无法连接对话备份服务，请稍后重试。');
+}
+
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function backupNotificationSettings(form, host) {
+  return {
+    successNoticeFrequency: form?.value?.successNoticeFrequency ?? host?.successNoticeFrequency ?? 'daily',
+    noticeDurationSeconds: form?.value?.noticeDurationSeconds ?? host?.noticeDurationSeconds ?? 3,
+  };
+}
+
+const writableForm = snapshot => snapshot?.status === 'ready' && snapshot.writable === true && snapshot.mode !== 'memory';
+
+/** Count display time only once a notification is visible; never take focus. */
+export function installNoticeAutoDismiss({ controller, notice, durationSeconds, globals = globalThis }) {
+  let timer;
+  let frame;
+  const clear = () => {
+    if (timer !== undefined) globals.clearTimeout(timer);
+    if (frame !== undefined) globals.cancelAnimationFrame?.(frame);
+    timer = frame = undefined;
+  };
+  const show = () => {
+    clear();
+    if (globals.document?.visibilityState === 'hidden') return;
+    const visible = () => {
+      frame = undefined;
+      if (globals.document?.visibilityState === 'hidden') return;
+      void controller.noticeVisible(notice.id);
+      timer = globals.setTimeout(() => controller.dismissNotice(notice.id), durationSeconds * 1000);
+    };
+    if (globals.requestAnimationFrame) frame = globals.requestAnimationFrame(visible);
+    else visible();
+  };
+  show();
+  globals.document?.addEventListener('visibilitychange', show);
+  return () => {
+    clear();
+    globals.document?.removeEventListener('visibilitychange', show);
+  };
+}
+
+/** Shared state prevents the plugin page and startup overlay from issuing duplicate checks. */
+export function createBackupController({ remote, form, pickDirectory, timers = globalThis }) {
+  let current = {
+    status: 'loading', host: null, form: form.getSnapshot(), error: '', operationError: '', noticeError: '',
+    setupOpen: false, visibleNotice: null, saving: false, running: false,
+    reloadPending: false, savedMessage: '',
+  };
+  let disposed = false;
+  let setupDismissed = false;
+  let requestedRoot = null;
+  let refreshTask;
+  let interval;
+  const listeners = new Set();
+  const dismissedNotices = new Set();
+  const acknowledging = new Set();
+  const acknowledged = new Set();
+  const publish = (changes) => {
+    if (disposed) return;
+    current = { ...current, ...changes };
+    for (const listener of listeners) listener();
+  };
+  const acceptHost = (host) => {
+    const disabled = host?.enabled === false;
+    const needsSetup = !disabled && host?.needsSetup === true;
+    const matchingRoot = requestedRoot === null || host?.destinationRoot === requestedRoot;
+    if (requestedRoot !== null && matchingRoot) requestedRoot = null;
+    const next = {
+      status: 'ready', host, error: '',
+      reloadPending: requestedRoot !== null,
+      setupOpen: needsSetup && !setupDismissed && requestedRoot === null,
+    };
+    if (disabled || ((host?.notice?.kind ?? current.visibleNotice?.kind) !== 'failure' && backupNotificationSettings(current.form, host).successNoticeFrequency === 'never')) next.visibleNotice = null;
+    else if (host?.notice && !dismissedNotices.has(host.notice.id)) {
+      // The host acknowledgement persists frequency; the toast owns its display timer.
+      next.visibleNotice = host.notice;
+    } else if (!host?.notice && current.visibleNotice?.kind === 'failure'
+      && ['success', 'unchanged'].includes(host?.lastAttempt?.state)) {
+      // Recovery can be silent once today's success notice has been shown.
+      // Close the preceding failure instead of leaving a stale failure dialog.
+      dismissedNotices.add(current.visibleNotice.id);
+      next.visibleNotice = null;
+    }
+    publish(next);
+  };
+  const refresh = () => {
+    if (disposed) return Promise.resolve(null);
+    if (refreshTask) return refreshTask;
+    refreshTask = Promise.resolve().then(() => remote.getState()).then(rpcValue).then((host) => {
+      acceptHost(host);
+      return host;
+    }).catch((error) => {
+      publish({ status: 'error', error: errorText(error) });
+      return null;
+    }).finally(() => { refreshTask = undefined; });
+    return refreshTask;
+  };
+  const offForm = form.subscribe(() => publish({ form: form.getSnapshot() }));
+  return {
+    getSnapshot: () => current,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    refresh,
+    start() {
+      if (disposed || interval !== undefined) return;
+      void refresh();
+      interval = timers.setInterval(() => { void refresh(); }, 3000);
+    },
+    dispose() {
+      disposed = true;
+      if (interval !== undefined) timers.clearInterval(interval);
+      offForm();
+      listeners.clear();
+    },
+    openSetup() {
+      setupDismissed = false;
+      publish({ setupOpen: true, error: '', savedMessage: '' });
+    },
+    dismissSetup() {
+      if (current.saving) return;
+      setupDismissed = true;
+      publish({ setupOpen: false });
+    },
+    pickDirectory,
+    async saveDestination(value) {
+      const destinationRoot = value.trim();
+      if (!destinationRoot) throw new Error('请选择或填写备份保存目录。');
+      if (current.saving) return false;
+      const snapshot = form.getSnapshot();
+      if (!writableForm(snapshot)) {
+        throw new Error('配置暂时不可写，请等待 DSH 连接完成后重试。');
+      }
+      publish({ saving: true, error: '', savedMessage: '' });
+      try {
+        const canonicalRoot = rpcValue(await remote.validateDestination(destinationRoot));
+        if (typeof canonicalRoot !== 'string' || !canonicalRoot.trim()) throw new Error('此目录无法用于备份，请选择其他目录。');
+        const accepted = await form.set('destinationRoot', canonicalRoot);
+        if (!accepted) throw new Error('保存目录失败，请重试。');
+        requestedRoot = canonicalRoot;
+        setupDismissed = false;
+        publish({
+          saving: false, setupOpen: false, reloadPending: true,
+          savedMessage: '保存目录已更新。', form: form.getSnapshot(),
+        });
+        void refresh();
+        return true;
+      } catch (error) {
+        publish({ saving: false, error: errorText(error) });
+        throw error;
+      }
+    },
+    async saveNotificationSettings({ successNoticeFrequency, noticeDurationSeconds }) {
+      if (current.saving) return false;
+      if (!writableForm(form.getSnapshot())) throw new Error('备份设置暂时不可写，请刷新页面后重试。');
+      if (!['daily', 'startup', 'always', 'never'].includes(successNoticeFrequency)) throw new Error('请选择有效的提醒频率。');
+      if (!Number.isInteger(noticeDurationSeconds) || noticeDurationSeconds < 1 || noticeDurationSeconds > 60) throw new Error('显示时长须为 1 到 60 秒的整数。');
+      publish({ saving: true, error: '', savedMessage: '' });
+      try {
+        const previous = backupNotificationSettings(form.getSnapshot(), current.host);
+        if (noticeDurationSeconds !== previous.noticeDurationSeconds && !await form.set('noticeDurationSeconds', noticeDurationSeconds)) throw new Error('保存显示时长失败，请重试。');
+        if (successNoticeFrequency !== previous.successNoticeFrequency && !await form.set('successNoticeFrequency', successNoticeFrequency)) throw new Error('保存提醒频率失败，请重试。');
+        publish({ form: form.getSnapshot(), savedMessage: '提醒设置已保存，立即生效。' });
+        await refresh();
+        return true;
+      } catch (error) {
+        publish({ error: errorText(error), form: form.getSnapshot() });
+        throw error;
+      } finally { publish({ saving: false }); }
+    },
+    async backupNow() {
+      if (current.running) return;
+      if (current.host?.enabled === false) {
+        publish({ operationError: '自动备份已停用，请先启用插件。' });
+        return;
+      }
+      if (current.host?.needsSetup || !current.host?.destinationRoot) {
+        this.openSetup();
+        return;
+      }
+      publish({ running: true, error: '', operationError: '', noticeError: '', savedMessage: '' });
+      try {
+        const outcome = rpcValue(await remote.backupNow());
+        if (outcome?.state === 'failed' || outcome?.state === 'failure') {
+          publish({ operationError: outcome.error || '备份失败，请确认保存目录可用后重试。' });
+        } else if (outcome?.state === 'disabled') {
+          publish({ operationError: '自动备份已停用，请先启用插件。' });
+        } else if (['stopped', 'unavailable'].includes(outcome?.state)) {
+          publish({ operationError: '备份服务正在重新加载，请稍后重试。' });
+        }
+        await refresh();
+      } catch (error) {
+        publish({ operationError: errorText(error) });
+      } finally {
+        publish({ running: false });
+      }
+    },
+    async noticeVisible(id) {
+      if (current.visibleNotice?.id !== id || acknowledged.has(id) || acknowledging.has(id)) return;
+      acknowledging.add(id);
+      try {
+        rpcValue(await remote.acknowledge(id));
+        acknowledged.add(id);
+        publish({ noticeError: '' });
+      } catch (error) {
+        publish({ noticeError: `提示状态未能保存：${errorText(error)}` });
+      } finally {
+        acknowledging.delete(id);
+      }
+    },
+    dismissNotice(id) {
+      const notice = current.visibleNotice;
+      if (id !== undefined && notice?.id !== id) return;
+      if (notice) dismissedNotices.add(notice.id);
+      publish({ visibleNotice: null, noticeError: '' });
+    },
+  };
+}
+
+/** Build components with the renderer's React instance and its native controls. */
+export function createBackupClient(React, { Modal, Button }, globals = globalThis) {
+  const h = React.createElement;
+  const TEXT_STYLE = { margin: '0 0 12px', lineHeight: 1.6, overflowWrap: 'anywhere' };
+  const ROW_STYLE = { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' };
+  const ERROR_STYLE = { ...TEXT_STYLE, color: 'var(--dsw-alias-state-error-primary)' };
+  const INPUT_STYLE = {
+    width: '100%', boxSizing: 'border-box', padding: '8px 10px', margin: '6px 0 10px',
+    border: '.5px solid var(--dsw-alias-border-l3)', borderRadius: 8,
+    color: 'var(--dsw-alias-label-primary)', background: 'var(--dsw-alias-bg-layer-1)',
+    font: 'inherit',
+  };
+  const useBackup = (controller) => React.useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
+
+  function PathEditor({ controller, initialPath, writable, saving, onboarding = false }) {
+    const [draft, setDraft] = React.useState(initialPath || '');
+    const [busy, setBusy] = React.useState(false);
+    const [error, setError] = React.useState('');
+    const inputId = React.useId();
+    React.useEffect(() => { setDraft(initialPath || ''); }, [initialPath]);
+    const choose = async () => {
+      setBusy(true);
+      setError('');
+      try {
+        const directory = await controller.pickDirectory();
+        if (typeof directory === 'string' && directory.trim()) setDraft(directory);
+      } catch (reason) { setError(`无法打开文件夹选择器：${errorText(reason)}`); }
+      finally { setBusy(false); }
+    };
+    const save = async () => {
+      setError('');
+      try { await controller.saveDestination(draft); }
+      catch (reason) { setError(errorText(reason)); }
+    };
+    const blocked = busy || saving || !writable;
+    return h('div', { 'data-dsh-backup-path-editor': true }, [
+      h('label', { htmlFor: inputId, key: 'label' }, '备份保存目录'),
+      h('input', {
+        id: inputId, key: 'input', type: 'text', value: draft, style: INPUT_STYLE,
+        placeholder: '选择文件夹，或填写完整目录路径', disabled: busy || saving,
+        'aria-invalid': error ? true : undefined,
+        'data-modal-autofocus': onboarding ? true : undefined,
+        onChange: (event) => { setDraft(event.currentTarget.value); setError(''); },
+      }),
+      h('div', { key: 'buttons', style: ROW_STYLE }, [
+        h(Button, { key: 'pick', variant: 'outline', disabled: busy || saving, onClick: choose }, busy ? '正在选择…' : '选择文件夹'),
+        h(Button, {
+          key: 'save', variant: 'primary', onClick: save,
+          disabled: blocked || !draft.trim() || (!onboarding && draft.trim() === (initialPath || '').trim()),
+        }, saving ? '正在保存…' : onboarding ? '保存并启用备份' : '保存目录'),
+      ]),
+      error ? h('p', { key: 'error', role: 'alert', style: { ...ERROR_STYLE, marginTop: 10 } }, error) : null,
+      !writable ? h('p', { key: 'readonly', role: 'status', style: { ...TEXT_STYLE, marginTop: 10 } }, '正在等待可写配置，请稍后重试。') : null,
+    ]);
+  }
+
+  function BackupSettings({ controller, view }) {
+    const state = useBackup(controller);
+    if (view === 'summary') return h('span', null, '自动备份 DSH 对话，支持选择保存目录与启动结果提醒。');
+    const configuredRoot = state.form?.value?.destinationRoot || state.host?.destinationRoot || '';
+    const attempt = state.host?.lastAttempt;
+    const writable = writableForm(state.form);
+    const status = state.host?.enabled === false ? '自动备份已停用。'
+      : state.reloadPending ? '正在应用新目录并检查备份…'
+      : state.running || state.host?.running || attempt?.state === 'running' ? '正在备份…'
+      : state.host?.needsSetup ? '尚未设置保存目录，自动备份未启动。'
+      : ['success', 'unchanged'].includes(attempt?.state) ? `最近备份成功${typeof attempt.files === 'number' ? ` · ${attempt.files} 个文件` : ''}${attempt.state === 'unchanged' ? ' · 无新增变化' : ''}`
+      : attempt?.state === 'failed' || attempt?.state === 'failure' ? `最近备份失败${attempt.error ? `：${attempt.error}` : ''}`
+      : state.status === 'loading' ? '正在读取备份状态…' : '等待备份检查。';
+    return h('div', { 'data-dsh-backup-settings': true }, [
+      h('p', { key: 'intro', style: TEXT_STYLE }, '启动时检查备份，每回合结束和定时检查会自动保存变化。'),
+      h(PathEditor, { key: 'path', controller, initialPath: configuredRoot, writable, saving: state.saving }),
+      h(NotificationSettings, { key: 'notifications', controller, state, writable }),
+      h('p', { key: 'status', role: 'status', style: { ...TEXT_STYLE, marginTop: 16 } }, status),
+      attempt?.finishedAt ? h('p', { key: 'time', style: TEXT_STYLE }, `检查时间：${new Date(attempt.finishedAt).toLocaleString()}`) : null,
+      state.savedMessage ? h('p', { key: 'saved', role: 'status', style: TEXT_STYLE }, state.savedMessage) : null,
+      state.error ? h('p', { key: 'error', role: 'alert', style: ERROR_STYLE }, state.error) : null,
+      state.operationError ? h('p', { key: 'operationError', role: 'alert', style: ERROR_STYLE }, state.operationError) : null,
+      h('div', { key: 'actions', style: ROW_STYLE }, [
+        h(Button, {
+          key: 'backup', variant: 'outline', onClick: () => { void controller.backupNow(); },
+          disabled: state.host?.enabled === false || state.running || state.saving || state.reloadPending || state.host?.running || !state.host?.destinationRoot,
+        }, state.running || state.host?.running ? '正在备份…' : '立即备份'),
+        h(Button, { key: 'refresh', variant: 'ghost', onClick: () => { void controller.refresh(); } }, '刷新状态'),
+      ]),
+      h('p', { key: 'hint', style: { ...TEXT_STYLE, marginTop: 14, color: 'var(--dsw-alias-label-tertiary)' } }, '更改保存目录后，将在新目录保存完整备份；原目录中的备份会保留。'),
+    ]);
+  }
+
+  function NotificationSettings({ controller, state, writable }) {
+    const configured = backupNotificationSettings(state.form, state.host);
+    const [frequency, setFrequency] = React.useState(configured.successNoticeFrequency);
+    const [duration, setDuration] = React.useState(String(configured.noticeDurationSeconds));
+    const [error, setError] = React.useState('');
+    const frequencyId = React.useId();
+    const durationId = React.useId();
+    React.useEffect(() => {
+      setFrequency(configured.successNoticeFrequency);
+      setDuration(String(configured.noticeDurationSeconds));
+    }, [configured.successNoticeFrequency, configured.noticeDurationSeconds]);
+    const unchanged = frequency === configured.successNoticeFrequency && Number(duration) === configured.noticeDurationSeconds;
+    const save = async () => {
+      setError('');
+      try { await controller.saveNotificationSettings({ successNoticeFrequency: frequency, noticeDurationSeconds: Number(duration) }); }
+      catch (reason) { setError(errorText(reason)); }
+    };
+    return h('fieldset', { style: { border: 0, borderTop: '.5px solid var(--dsw-alias-border-l3)', padding: '16px 0 0', margin: '20px 0 16px' } }, [
+      h('legend', { key: 'title', style: { paddingTop: 12, fontWeight: 600 } }, '备份提醒'),
+      h('label', { key: 'frequency-label', htmlFor: frequencyId }, '成功提醒频率'),
+      h('select', { key: 'frequency', id: frequencyId, value: frequency, disabled: state.saving || !writable,
+        onChange: event => setFrequency(event.currentTarget.value), style: { ...INPUT_STYLE, maxWidth: 300, display: 'block' } }, [
+        h('option', { key: 'daily', value: 'daily' }, '每天首次成功时'),
+        h('option', { key: 'startup', value: 'startup' }, '每次启动首次成功时'),
+        h('option', { key: 'always', value: 'always' }, '每次成功检查后'),
+        h('option', { key: 'never', value: 'never' }, '不显示成功提醒'),
+      ]),
+      h('label', { key: 'duration-label', htmlFor: durationId }, '显示时长（秒）'),
+      h('input', { key: 'duration', id: durationId, type: 'number', min: 1, max: 60, step: 1, value: duration,
+        disabled: state.saving || !writable, onChange: event => setDuration(event.currentTarget.value),
+        style: { ...INPUT_STYLE, maxWidth: 120, display: 'block' } }),
+      h('p', { key: 'hint', style: { ...TEXT_STYLE, color: 'var(--dsw-alias-label-tertiary)' } }, '提醒显示在右下角，到时自动消失，无需点击。备份失败仍会提醒，可在本页查看详情。'),
+      h(Button, { key: 'save', variant: 'outline', disabled: state.saving || !writable || unchanged, onClick: save }, '保存提醒设置'),
+      error ? h('p', { key: 'error', role: 'alert', style: ERROR_STYLE }, error) : null,
+    ]);
+  }
+
+  function BackupOverlay({ controller }) {
+    const state = useBackup(controller);
+    const notice = state.visibleNotice;
+    const duration = backupNotificationSettings(state.form, state.host).noticeDurationSeconds;
+    React.useEffect(() => {
+      if (!notice || state.setupOpen) return;
+      return installNoticeAutoDismiss({ controller, notice, durationSeconds: duration, globals });
+    }, [controller, notice?.id, state.setupOpen, duration]);
+    if (state.setupOpen) {
+      const writable = writableForm(state.form);
+      return h(Modal, {
+        open: true, title: '设置 DSH 对话备份', closeLabel: '稍后设置',
+        description: '第一次使用，请选择备份保存目录。保存后开始自动备份。',
+        onClose: () => controller.dismissSetup(),
+        footer: h(Button, { variant: 'outline', disabled: state.saving, onClick: () => controller.dismissSetup() }, '稍后设置'),
+      }, h(PathEditor, { controller, initialPath: '', writable, saving: state.saving, onboarding: true }));
+    }
+    if (!notice) return null;
+    const failure = notice.kind === 'failure';
+    return h('aside', {
+      'data-dsh-backup-toast': true, role: failure ? 'alert' : 'status',
+      'aria-live': failure ? 'assertive' : 'polite', 'aria-atomic': true,
+      style: { position: 'fixed', right: 20, bottom: 20, width: 360, maxWidth: 'calc(100vw - 40px)',
+        maxHeight: 'calc(100vh - 40px)', overflowY: 'auto', boxSizing: 'border-box', zIndex: 1000, pointerEvents: 'auto',
+        padding: 16, borderRadius: 12, border: '.5px solid var(--dsw-alias-border-l3)',
+        color: 'var(--dsw-alias-label-primary)', background: 'var(--dsw-alias-bg-layer-1)',
+        boxShadow: '0 4px 24px rgba(0, 0, 0, .16)' },
+    }, [
+      h('div', { key: 'header', style: { ...ROW_STYLE, justifyContent: 'space-between', flexWrap: 'nowrap', alignItems: 'start' } }, [
+        h('strong', { key: 'title', style: { lineHeight: 1.5 } }, notice.title || (failure ? 'DSH 对话备份失败' : 'DSH 对话备份成功')),
+        h('button', { key: 'close', type: 'button', 'aria-label': '关闭备份提醒', onClick: () => controller.dismissNotice(notice.id),
+          style: { border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 18, padding: '0 2px', lineHeight: 1.2 } }, '×'),
+      ]),
+      h('p', { key: 'message', style: { ...TEXT_STYLE, marginTop: 8, marginBottom: failure ? 12 : 0, whiteSpace: 'pre-line' } }, notice.message),
+      state.error ? h('p', { key: 'error', role: 'alert', style: ERROR_STYLE }, state.error) : null,
+      state.operationError ? h('p', { key: 'operationError', role: 'alert', style: ERROR_STYLE }, state.operationError) : null,
+      state.noticeError ? h('p', { key: 'ack', role: 'alert', style: ERROR_STYLE }, state.noticeError) : null,
+      state.noticeError ? h(Button, { key: 'ackRetry', variant: 'outline', onClick: () => { void controller.noticeVisible(notice.id); } }, '重试保存提示状态') : null,
+      failure ? h(Button, { key: 'retry', variant: 'outline', disabled: state.running || state.host?.running,
+        onClick: () => { void controller.backupNow(); } }, state.running || state.host?.running ? '正在重试…' : '重试备份') : null,
+    ]);
+  }
+
+  return {
+    inject: ['slots', 'remote', 'configForms', 'uiWorkspace'],
+    async apply(ctx) {
+      const offRemote = await ctx.remote.$mount(BACKUP_REMOTE_CONTRIBUTION);
+      const remote = ctx.get('remote.dshChatBackup');
+      const form = ctx.configForms.get('dsh-chat-backup');
+      const pickDirectory = () => globals.__DSH_DIRECTORY_PICKER__ === undefined
+        ? ctx.uiWorkspace.pickDirectory() : globals.__DSH_DIRECTORY_PICKER__.pick();
+      const controller = createBackupController({ remote, form, pickDirectory, timers: globals });
+      ctx.effect(() => {
+        controller.start();
+        return () => controller.dispose();
+      }, 'dsh-chat-backup: client status');
+      const injected = () => ({ controller });
+      ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+        name: 'plugins.bundle.config', key: 'dsh-chat-backup', inject: injected,
+      }, BackupSettings));
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay', id: 'dsh-chat-backup.status', order: 100, inject: injected,
+      }, BackupOverlay));
+      return offRemote;
+    },
+  };
+}
