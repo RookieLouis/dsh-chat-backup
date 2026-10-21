@@ -17,7 +17,7 @@ async function withFixture(run) {
   const create = async (options = {}) => {
     const controller = await createController({
       sourceRoot, destinationRoot, now: () => new Date(TODAY),
-      backup: async () => successful('success'), verifySnapshot: async () => ({ valid: true, sourceRoot }),
+      backup: async () => successful('success'), verifySnapshot: async () => ({ valid: true, sourceRoot: await fs.realpath(sourceRoot) }),
       readStatus: async () => successful('success'), ...options,
     });
     controllers.push(controller);

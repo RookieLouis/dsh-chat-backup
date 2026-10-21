@@ -37,7 +37,7 @@ async function withFixture(run) {
     const controller = await createController({
       sourceRoot, destinationRoot, now: () => new Date(TODAY),
       backup: async () => success(), readStatus: async () => null,
-      verifySnapshot: async () => ({ valid: true, sourceRoot }),
+      verifySnapshot: async () => ({ valid: true, sourceRoot: await fs.realpath(sourceRoot) }),
       ...overrides,
     });
     controllers.push(controller);
@@ -70,7 +70,7 @@ test('today’s valid snapshot from another source retries startup without annou
       verifySnapshot: async (destination, snapshotId) => {
         checks.push({ destination, snapshotId });
         return { valid: true, sourceRoot: snapshotId === 'other-source-snapshot'
-          ? path.join(fixture.root, 'different-source') : fixture.sourceRoot };
+          ? path.join(fixture.root, 'different-source') : await fs.realpath(fixture.sourceRoot) };
       },
     });
     const starting = controller.startup(trigger => controller.perform({ trigger }));
